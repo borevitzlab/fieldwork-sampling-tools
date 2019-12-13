@@ -1,0 +1,10 @@
+name: fieldwork
+channels:
+  - conda-forge
+dependencies:
+  - python=3.*
+  - numpy
+  - tqdm
+  - zbarlight
+  - qrcode
+  - reportlab

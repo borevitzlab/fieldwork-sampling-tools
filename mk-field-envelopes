@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+import reportlab
+import qrcode
+from qrcode.constants import ERROR_CORRECT_H
+from reportlab.lib.units import cm, inch, mm
+from reportlab.pdfgen import canvas
+from tqdm import tqdm
+
+import argparse
+import csv
+import sys
+
+
+DL = (110 * mm, 220*mm)
+
+
+def make_page(canvas, ID):
+    c = canvas
+
+    qrimg = qrcode.make(ID, error_correction=ERROR_CORRECT_H, box_size=40)
+    c.drawInlineImage(qrimg, 0.5*cm, DL[1]-14*cm, width=10*cm, height=10*cm)
+    
+    c.setFont('Courier-Bold', 24)
+    c.drawCentredString(DL[0]/2, DL[1] - 4*cm, ID)
+    c.drawCentredString(DL[0]/2, 2*cm, ID)
+
+    c.setFont('Courier-Bold', 24)
+    c.drawCentredString(DL[0]/2, DL[1] - 4*cm, ID)
+    c.drawCentredString(DL[0]/2, 2*cm, ID)
+
+    c.setFont('Courier', 12)
+    c.drawString(10*mm, 82*mm, "Spp:")
+    c.line(10*mm, 80*mm, 100*mm, 80*mm)
+    c.drawString(10*mm, 67*mm, "Lat/Lon:")
+    c.line(10*mm, 65*mm, 100*mm, 65*mm)
+    c.drawString(10*mm, 52*mm, "Date:")
+    c.line(10*mm, 50*mm, 100*mm, 50*mm)
+    c.line(10*mm, 35*mm, 100*mm, 35*mm)
+
+    c.showPage()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-o", "--output", type=argparse.FileType("wb"), required=True,
+            help="PDF output file")
+    ap.add_argument("-c", "--csv", type=argparse.FileType("r"), default=None,
+            help="Take IDs from column named 'FieldID' in a CSV file. File can have many columns. -f/-s/-e ignored when this is used.")
+    ap.add_argument("-f", "--format", type=str, default="BVZ{:04d}",
+            help="Python-style format string e.g. KDM{:04d} gives KDM0001")
+    ap.add_argument("-s", "--start-id", type=int, default=1,
+            help="First numeric ID (default 1)")
+    ap.add_argument("-e", "--end-id", type=int, default=100,
+            help="Last numeric ID (default 100)")
+    args = ap.parse_args()
+
+    canv = canvas.Canvas(args.output, pagesize=DL)
+    if args.csv is not None:
+        records = csv.DictReader(args.csv)
+        for record in tqdm(records):
+            try:
+                make_page(canv, record["FieldID"])
+            except KeyError:
+                print("File does not have column 'FieldID'", file=sys.stderr)
+                sys.exit(1)
+    else:
+        for idnum in tqdm(range(args.start_id, args.end_id + 1)):
+            make_page(canv, args.format.format(idnum))
+    canv.save()
+
+
+if __name__ == "__main__":
+    main()
