@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+# External
+try:
+    import exifread
+    import numpy as np
+    import PIL
+    from PIL import Image
+    from PIL.ExifTags import TAGS, GPSTAGS
+    from tqdm import tqdm
+    import zbarlight
+except ImportError as exc:
+    import sys
+    print("Dependencies not met:", str(exc))
+    print("Use one of the following to install dependencies:")
+    print("\n\tpip install exifread numpy pillow tqdm msgpack pyyaml")
+    print("\nor with conda:\n\n\tconda install exifread numpy pillow tqdm msgpack-python pyyaml && pip install py3exiv2")
+    sys.exit(1)
+
+
+# Internal
+import argparse
+import csv
+from os.path import basename, splitext
+from functools import partial
+import logging
+from logging import ERROR, WARNING, INFO, DEBUG
+import multiprocessing as mp
+import os
+import shutil
+from sys import stdin, stdout, stderr
+
+def get_logger(level=INFO):
+    log = logging.getLogger(__name__)
+    log.setLevel(level)
+    stderr = logging.StreamHandler()
+    stderr.setLevel(DEBUG)
+    stderr.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(stderr)
+    return log
+
+LOG = get_logger()
+
+
+def get_qrcode(image):
+    codes = zbarlight.scan_codes('qrcode', image)
+    if codes is not None:
+        if len(codes) == 1:
+            return codes[0].decode('utf8')
+    x, y = image.size
+    # Reduce image size until the barcode scans
+    for scalar in list(np.sqrt(np.arange(1.0, 0.01, -0.03))):
+        LOG.debug("scalar is: %r", scalar)
+        img_scaled = image.resize((int(x*scalar), int(y*scalar)))
+        codes = zbarlight.scan_codes('qrcode', img_scaled)
+        LOG.debug("got codes: %r", codes)
+        if codes is not None:
+            if len(codes) == 1:
+                return codes[0].decode('utf8')
+            elif len(codes) > 1:
+                LOG.warn("Image with more than 1 QR code: '%s'", image.filename)
+                return None
+
+
+def get_exif(image):
+    exifdata = image._getexif()
+    decoded = dict((TAGS.get(key, key), value) for key, value in exifdata.items())
+    datetime = decoded['DateTimeOriginal']
+    try:
+        # GPS EXIF Vomit.
+        # {
+        #     1: 'N', # latitude ref
+        #     2: ((51, 1), (3154, 100), (0, 1)), # latitude, rational degrees, mins, secs
+        #     3: 'W', # longitude ref
+        #     4: ((0, 1), (755, 100), (0, 1)), # longitude rational degrees, mins, secs
+        #     5: 0, # altitude ref: 0 = above sea level, 1 = below sea level
+        #     6: (25241, 397), # altitude, expressed as a rational number
+        #     7: ((12, 1), (16, 1), (3247, 100)), # UTC timestamp, rational H, M, S
+        #     16: 'T', # image direction when captured, T = true, M = magnetic
+        #     17: (145423, 418) # image direction in degrees, rational
+        # }
+
+        # Latitude
+        lat = [float(x) / float(y) for x, y in decoded['GPSInfo'][2]] # pull out latitude
+        lat = lat[0] + lat[1] / 60
+        if decoded['GPSInfo'][1] == "S": # correction for location relative to equator
+            lat *= -1
+
+        # Longitude
+        lon = [float(x) / float(y) for x, y in decoded['GPSInfo'][4]] # pull out longditude
+        lon = lon[0] + lon[1] / 60
+        if decoded['GPSInfo'][3] == "W": # corection for location relative to g'wch
+            lon *= -1
+
+        # Elevation
+        alt = float(decoded['GPSInfo'][6][0]) / float(decoded['GPSInfo'][6][1])
+        gps = (lat,lon,alt)
+    except KeyError:
+        gps = None
+    return datetime, gps
+
+
+
+def process_image(output, f):
+    try:
+        image = Image.open(f)
+    except Exception as exc:
+        LOG.error("Couldn't read image '%s'", f)
+        LOG.info("ERROR: %s", str(exc))
+        return None
+
+    image_code = get_qrcode(image)
+    if not image_code:
+        image_code = "unknown"
+
+    datetime, gps = get_exif(image)
+    if gps is None:
+        gps = ("NA", "NA", "NA")
+    return (f, image_code, datetime, *gps)
+
+def do_cpmv(src, dst, copy, move):
+    if copy:
+        print("copy", src, '->', dst)
+        shutil.copyfile(src, dst)
+    elif move:
+        print("move", src, '->', dst)
+        shutil.move(src, dst)
+    else:
+        print("cp", src, dst)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-t", "--threads", type=int, default=mp.cpu_count(),
+            help="Number of CPUs to use for image decoding/scanning")
+    ap.add_argument("-c", "--copy", action="store_true",
+            help="Actually do a copy")
+    ap.add_argument("-m", "--move", action="store_true",
+            help="Actually do a move")
+    ap.add_argument("-M", "--metadata", type=argparse.FileType('w'),
+            help="Write metadata to TSV file here")
+    ap.add_argument("-o", "--output", type=str, default="{ID}_{FN}.{EXT}",
+            help="Format string governing output. fields are {ID} for best guess of id, {FN} for original file basename, {EXT} for original extension.")
+    ap.add_argument("images", nargs="+",
+            help="List of images")
+    args = ap.parse_args()
+
+    # Setup output
+    if args.threads > 1:
+        pool = mp.Pool(args.threads)
+        map_ = pool.imap
+    else:
+        map_ = map
+    proc_img_with_opts = partial(process_image, args.output)
+    metadata = [x for x in tqdm(map_(proc_img_with_opts, args.images)) if x is not None]
+    del pool
+    metadata = list(sorted(metadata))
+    if args.metadata is not None:
+        print("ID", "Latitude", "Longitude", "Elevation", "DateTime", "NPhotos", sep='\t', file=args.metadata)
+        
+    last = 'unknown'
+    last_lled = None  # lat lon elev date of last qrcode
+    photos = []
+    for (fn, id, dt, lt, ln, el) in metadata:
+        if id != 'unknown':
+            if last != 'unknown':
+                if args.metadata is not None:
+                    print(last, *last_lled, len(photos), sep='\t', file=args.metadata)
+                for photo in photos:
+                    base, ext = splitext(basename(photo))
+                    dest = args.output.format(ID=last, FN=base, EXT=ext.lstrip('.'))
+                    do_cpmv(photo, dest, args.copy, args.move)
+            last_lled = (lt, ln, el, dt)
+            last = id
+            photos = []
+        photos.append(fn)
+    if last != 'unknown':
+        if args.metadata is not None:
+            print(last, *last_lled, len(photos), sep='\t', file=args.metadata)
+        for photo in photos:
+            base, ext = splitext(basename(photo))
+            dest = args.output.format(ID=last, FN=base, EXT=ext.lstrip('.'))
+            do_cpmv(photo, dest, args.copy, args.move)
+
+
+
+if __name__ == "__main__":
+    main()
